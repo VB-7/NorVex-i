@@ -1,50 +1,53 @@
 plugins {
-    id("com.android.application")
+    id 'com.android.application'
 }
 
 android {
-    namespace = "com.norvex.image"
-    compileSdk = 34
+    namespace 'com.norvex.image'
+    compileSdk 34
 
     defaultConfig {
-        applicationId = "com.norvex.image"
-        minSdk = 26
-        targetSdk = 34
+        applicationId 'com.norvex.image'
+        minSdk 26
+        targetSdk 34
         // Nomor versi OTOMATIS dari nomor build GitHub (untuk update otomatis:
         // tag "b<N>" dibaca sebagai versionCode N. Lokal default 1).
         def vcEnv = System.getenv("VC")
         int vcNum = 1
         try { vcNum = Integer.parseInt(String.valueOf(vcEnv == null ? "1" : vcEnv).trim()) } catch (Exception ignored) { vcNum = 1 }
-        versionCode = vcNum
-        versionName = "1.0." + vcNum
+        versionCode vcNum
+        versionName "1.0." + vcNum
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     signingConfigs {
         nvx {
-            storeFile = file("../norvexi.keystore")
-            storePassword = System.getenv("KS_PASS") ?: "norvexi123"
-            keyAlias = "norvexi"
-            keyPassword = System.getenv("KS_PASS") ?: "norvexi123"
+            storeFile file("../norvexi.keystore")
+            storePassword System.getenv("KS_PASS") ?: "norvexi123"
+            keyAlias "norvexi"
+            keyPassword System.getenv("KS_PASS") ?: "norvexi123"
         }
     }
 
     buildTypes {
-        release {
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.nvx
-        }
         debug {
             // Install langsung tanpa tanda tangan, tapi TANPA alat pantau
             // debug (debuggable=false) agar ringan seperti build rilis.
-            debuggable = false
+            debuggable false
         }
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        release {
+            // Tanpa minify: jembatan JS window.__imageStudio tidak boleh dibuang.
+            minifyEnabled false
+            // Tanda tangan: kunci tetap dari secret (bootstrap: norvexi123).
+            signingConfig signingConfigs.nvx
+        }
     }
 }
 
 dependencies {
-    implementation("androidx.core:core:1.13.1")
+    implementation "androidx.core:core:1.13.1"
 }
