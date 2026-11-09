@@ -1,5 +1,6 @@
 package com.norvex.image;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
@@ -9,6 +10,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -58,6 +60,7 @@ public class MainActivity extends Activity {
     private static final String UPDATE_REPO = "VB-7/NorVex-i";
     private static final String UPD_PREF_TAG = "upd_tag"; // tag APK update yg sudah terunduh
     private static long lastUpdateCheckAt = 0; // throttle: maks 1x per 10 mnt (anti spam API)
+    private static final int REQ_STORAGE = 8; // izin tulis (HP Android 9/10)
 
     // Elemen Perchance yang disembunyikan (menu/iklan/konsol) — rules AdBlock norvex-r.
     private static final String[] HIDE_IDS = {
@@ -137,6 +140,7 @@ public class MainActivity extends Activity {
         setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
 
         resolveStorage();
+        ensureStoragePerm(); // minta izin tulis SEKALI (HP Android 9/10)
 
         // Anti-blackscreen (pola norvex-r): semua lapis hitam, bar sistem tampil normal.
         android.widget.FrameLayout root = new android.widget.FrameLayout(this);
@@ -354,6 +358,45 @@ public class MainActivity extends Activity {
                 .setPositiveButton("Keluar", (d, w) -> finish())
                 .setNegativeButton("Batal", null)
                 .show();
+    }
+
+    // Izin tulis (HP Android 9/10, API<=29): tanpa ini folder
+    // perchance_app/Generete_Image tak bisa ditulis, semua diam-diam jatuh
+    // ke folder aplikasi (user tak menemukan file di file manager + tak ada
+    // izin di Setting aplikasi). Minta SEKALI saja (dicatat): kalau user
+    // menolak permanen, jangan nagih tiap buka. Pola NorVex-R.
+    private void ensureStoragePerm() {
+        try {
+            if (Build.VERSION.SDK_INT <= 29
+                    && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                SharedPreferences sp = getSharedPreferences("nv-i", MODE_PRIVATE);
+                if (sp.getBoolean("storage_asked", false)) return;
+                try { sp.edit().putBoolean("storage_asked", true).apply(); } catch (Exception ignored) {}
+                requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int req, String[] perms, int[] grants) {
+        super.onRequestPermissionsResult(req, perms, grants);
+        try {
+            if (req == REQ_STORAGE) {
+                boolean ok = grants != null && grants.length > 0
+                        && grants[0] == PackageManager.PERMISSION_GRANTED;
+                if (ok) {
+                    resolveStorage(); // coba lagi folder utama, sekarang berizin
+                    toast(usingFallback
+                            ? "Izin OK, tapi folder utama tetap gagal — pakai ASD"
+                            : "Izin penyimpanan OK — file di perchance_app/Generete_Image");
+                    trace("izin tulis diberikan");
+                } else {
+                    toast("Tanpa izin, file tersimpan di folder aplikasi (bukan perchance_app)");
+                    trace("izin tulis ditolak");
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     // ---------------------------------------------------------------- web <-> native
