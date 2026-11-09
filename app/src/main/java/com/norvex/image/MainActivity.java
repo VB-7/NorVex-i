@@ -54,7 +54,6 @@ public class MainActivity extends Activity {
 
     private static final String START_URL = "https://perchance.org/norvex-i";
     private static final String PRIMARY_ROOT = "/storage/emulated/0/perchance_app/Generete_Image";
-    private static final String BACKUP_NAME = "backup_gallery.json";
     // Repo GitHub untuk update otomatis (pola NorVex-R). GANTI dengan repo kamu,
     // mis. "USERNAME_KAMU/NorVex-I". Tag rilis "b<N>" dibaca sebagai versionCode N.
     private static final String UPDATE_REPO = "VB-7/NorVex-i";
@@ -77,13 +76,19 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final AtomicInteger fileCounter = new AtomicInteger(0);
-    private final Runnable backupTick = this::pushBackupToWeb;
     private android.widget.FrameLayout webRoot = null; // wadah WebView (buat ulang saat renderer mati)
     private boolean pageDone = false;
 
     // ---- update otomatis (pola NorVex-R) ----
     private long updateDownloadId = -1;
-    private AlertDialog updateDialog = null;
+    private static final int REQ_NOTIF = 9; // izin notifikasi (Android 13+)
+    private AlertDialog retryDlg = null; // dialog "coba lagi" saat offline/gagal muat
+    private boolean pageFailed = false;
+    private final java.util.Map<Long, String> httpNames = new java.util.HashMap<Long, String>();
+    // Manifest backup chunk (di memori): dibaca sekali saat start.
+    private String manifestSig = null;
+    private int manifestCount = 0;
+    private int manifestRev = 0;
 
     private File rootDir;       // Generete_Image/ (primer atau fallback)
     private File generationDir; // Generation/
@@ -126,10 +131,21 @@ public class MainActivity extends Activity {
         }
         generationDir = new File(rootDir, "Generation");
         backupDir = new File(rootDir, "Backup_Gallery");
+        ensureNoMedia(generationDir); // hasil generate jangan menyampah ke galeri HP
+        ensureNoMedia(backupDir);
     }
 
-    private File backupFile() {
-        return new File(backupDir, BACKUP_NAME);
+    private void ensureNoMedia(File dir) {
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            File nm = new File(dir, ".nomedia");
+            if (!nm.exists()) {
+                try (OutputStream o = new FileOutputStream(nm)) {
+                    o.write(0);
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     // ---------------------------------------------------------------- lifecycle
@@ -141,6 +157,8 @@ public class MainActivity extends Activity {
 
         resolveStorage();
         ensureStoragePerm(); // minta izin tulis SEKALI (HP Android 9/10)
+        ensureNotifPerm(); // izin notifikasi SEKALI (Android 13+)
+        hookCrashLogger(); // catat force-close ke error/
 
         // Anti-blackscreen (pola norvex-r): semua lapis hitam, bar sistem tampil normal.
         android.widget.FrameLayout root = new android.widget.FrameLayout(this);
@@ -187,9 +205,8 @@ public class MainActivity extends Activity {
             if (webRoot != null) webRoot.addView(web, new android.widget.FrameLayout.LayoutParams(
                     android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                     android.view.ViewGroup.LayoutParams.MATCH_PARENT));
-            toast(usingFallback
-                    ? "Folder utama gagal ditulis — pakai ASD"
-                    : "Storage: perchance_app/Generete_Image");
+            // Diam (background): posisi storage hanya dicatat ke trace.
+            trace(usingFallback ? "storage: ASD (utama gagal ditulis)" : "storage: perchance_app/Generete_Image");
 
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
@@ -258,11 +275,24 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 pageDone = true;
+                pageFailed = false;
+                try { if (retryDlg != null) retryDlg.dismiss(); } catch (Exception ignored) {}
                 injectCleanCss();
+                setNativeTotal();
                 pullBackupFromWeb();
-                pushBackupFileToWeb(); // restore galeri dari file backup
-                main.removeCallbacks(backupTick);
-                main.postDelayed(backupTick, 4000);
+            }
+
+            // Gagal muat (offline/kuota/sinyal): dialog jujur + tombol coba lagi.
+            // Tanpa ini user mentok di halaman error dan harus restart aplikasi.
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, android.webkit.WebResourceError error) {
+                try {
+                    boolean isMain = true;
+                    try { isMain = request == null || request.isForMainFrame(); } catch (Exception ignored) {}
+                    if (!isMain || pageDone) return;
+                    pageFailed = true;
+                    main.post(() -> showRetryDialog());
+                } catch (Exception ignored) {}
             }
 
             // Proses tampil MATI (tanpa dialog/crash): jangan diam hitam.
@@ -311,15 +341,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        pushBackupToWeb();
+        try { pullBackupFromWeb(); } catch (Exception ignored) {} // checkpoint: hash-gated, murah
     }
 
     @Override
     protected void onDestroy() {
-        main.removeCallbacks(backupTick);
         io.shutdown();
         try { unregisterReceiver(dlReceiver); } catch (Exception ignored) {}
-        try { if (updateDialog != null) updateDialog.dismiss(); } catch (Exception ignored) {}
+        try { if (retryDlg != null) retryDlg.dismiss(); } catch (Exception ignored) {}
         try {
             web.destroy();
         } catch (Exception ignored) {
@@ -329,10 +358,10 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        // Dialog update paling atas: tutup dulu (pola NorVex-R).
+        // Dialog retry paling atas: tutup dulu.
         try {
-            if (updateDialog != null && updateDialog.isShowing()) {
-                try { updateDialog.dismiss(); } catch (Exception ignored) {}
+            if (retryDlg != null && retryDlg.isShowing()) {
+                try { retryDlg.dismiss(); } catch (Exception ignored) {}
                 return;
             }
         } catch (Exception ignored) {}
@@ -387,14 +416,31 @@ public class MainActivity extends Activity {
                         && grants[0] == PackageManager.PERMISSION_GRANTED;
                 if (ok) {
                     resolveStorage(); // coba lagi folder utama, sekarang berizin
-                    toast(usingFallback
-                            ? "Izin OK, tapi folder utama tetap gagal — pakai ASD"
-                            : "Izin penyimpanan OK — file di perchance_app/Generete_Image");
                     trace("izin tulis diberikan");
                 } else {
+                    // Satu-satunya toast izin: user perlu tahu nasib filenya.
                     toast("Tanpa izin, file tersimpan di folder aplikasi (bukan perchance_app)");
                     trace("izin tulis ditolak");
                 }
+            } else if (req == REQ_NOTIF) {
+                boolean ok = grants != null && grants.length > 0
+                        && grants[0] == PackageManager.PERMISSION_GRANTED;
+                trace(ok ? "izin notifikasi diberikan" : "izin notifikasi ditolak (diam)");
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // Izin notifikasi (Android 13+): tanpa ini notifikasi progres unduhan
+    // tidak tampil. Minta SEKALI saja, selebihnya diam.
+    private void ensureNotifPerm() {
+        try {
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                SharedPreferences sp = getSharedPreferences("nv-i", MODE_PRIVATE);
+                if (sp.getBoolean("notif_asked", false)) return;
+                try { sp.edit().putBoolean("notif_asked", true).apply(); } catch (Exception ignored) {}
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_NOTIF);
             }
         } catch (Exception ignored) {}
     }
@@ -420,40 +466,145 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Tarik galeri dari web → tulis backup (dipakai berkala + saat jeda). */
-    private void pushBackupToWeb() {
-        pullBackupFromWeb();
+    // ---------------------------------------------------------------- backup lazy
+    // Arsip: part-000.json, part-001.json, ... @100 item + manifest.json
+    // {count,rev,sig,parts} + manifest.bak (fallback WAJIB dipakai).
+    // Sinkron hash-gated: sig sama -> lewati total (tidak tarik/upload ulang).
+    // Transport 5 item per panggil (batas binder) + fallback 1-per-1.
+    private static final int BACKUP_PART_SIZE = 100;
+    private static final int BRIDGE_PAGE = 5;
+
+    private File manifestFile() { return new File(backupDir, "manifest.json"); }
+    private File manifestBakFile() { return new File(backupDir, "manifest.bak"); }
+    private File partFile(int i) { return new File(backupDir, String.format(java.util.Locale.US, "part-%03d.json", i)); }
+
+    /** Kirim total arsip ke web agar scroll lazy tahu batasnya. */
+    private void setNativeTotal() {
+        readManifest();
+        final int total = manifestCount;
+        try {
+            web.evaluateJavascript(
+                    "(function(){try{"
+                            + "if(window.__imageStudio&&window.__imageStudio.setNativeTotal)"
+                            + "window.__imageStudio.setNativeTotal(" + total + ");"
+                            + "}catch(e){}})();",
+                    null);
+        } catch (Exception ignored) {}
     }
 
+    /** Checkpoint: start + jeda. Murah bila sig sama (lewati). */
     private void pullBackupFromWeb() {
         try {
             web.evaluateJavascript(
                     "(function(){try{"
-                            + "if(!window.__imageStudio||!window.__imageStudio.getGallery)return 'null';"
-                            + "return JSON.stringify(window.__imageStudio.getGallery());"
+                            + "if(!window.__imageStudio||!window.__imageStudio.getStateMeta)return 'null';"
+                            + "return JSON.stringify(window.__imageStudio.getStateMeta());"
                             + "}catch(e){return 'null';}})();",
-                    value -> io.execute(() -> writeBackupJson(unescapeJsString(value))));
+                    value -> io.execute(() -> onStateMeta(unescapeJsString(value))));
         } catch (Exception ignored) {
         }
     }
 
-    /** Dorong backup ke web setelah halaman siap. */
-    private void pushBackupFileToWeb() {
-        io.execute(() -> {
-            String json = readBackupJson();
-            if (json == null || json.equals("[]")) return;
+    private void onStateMeta(String metaJson) {
+        try {
+            if (metaJson == null) return;
+            JSONObject m = new JSONObject(metaJson);
+            int webLen = m.optInt("len", -1);
+            int webRev = m.optInt("rev", 0);
+            String webSig = m.optString("sig", "");
+            if (webLen < 0 || webSig.isEmpty()) return;
+            readManifest();
+            if (webSig.equals(manifestSig)) {
+                trace("backup sama, lewati (" + webLen + ")");
+                // Arsip lebih baru dari web (jarang): dorong 10 pertama.
+                if (manifestRev > webRev && manifestCount > 0) pushFirstItems();
+                return;
+            }
+            syncAllPaged(webLen, webRev, webSig);
+        } catch (Exception e) {
+            trace("backup meta gagal: " + e);
+        }
+    }
+
+    /** Tarik SEMUA item 5-per-panggil, tulis per 100 ke part file. Kosong pun ditulis (anti hidup-lagi). */
+    private void syncAllPaged(int webLen, int webRev, String webSig) {
+        try {
+            java.util.ArrayList<JSONObject> batch = new java.util.ArrayList<JSONObject>(BACKUP_PART_SIZE);
+            int part = 0;
+            int got = 0;
+            for (int off = 0; off < webLen; off += BRIDGE_PAGE) {
+                JSONArray arr = fetchPage(off, BRIDGE_PAGE);
+                if (arr == null || arr.length() == 0) break;
+                for (int i = 0; i < arr.length(); i++) {
+                    try { batch.add(arr.getJSONObject(i)); } catch (Exception ignored) {}
+                }
+                got += arr.length();
+                while (batch.size() >= BACKUP_PART_SIZE) {
+                    writePart(part++, new JSONArray(batch.subList(0, BACKUP_PART_SIZE)));
+                    batch = new java.util.ArrayList<JSONObject>(batch.subList(BACKUP_PART_SIZE, batch.size()));
+                }
+                if (arr.length() < BRIDGE_PAGE) break;
+            }
+            if (!batch.isEmpty() || got == 0) writePart(part++, new JSONArray(batch));
+            // Bersihkan sisa part basi + tulis manifest (bak = manifest lama).
+            int parts = Math.max(1, part);
+            cleanupParts(parts);
+            writeManifest(webLen == 0 ? 0 : got, webRev, webSig, parts);
+            readManifest();
+            setNativeTotal();
+            trace("backup tulis: " + got + " item, " + parts + " part");
+        } catch (Exception e) {
+            trace("backup sync gagal: " + e);
+        }
+    }
+
+    /** Ambil 1 halaman dari web; gagal -> coba 1-per-1; tetap gagal -> null. */
+    private JSONArray fetchPage(int off, int lim) {
+        try {
+            String raw = evalBridge(
+                    "(function(){try{return window.__imageStudio.getItemsJSON(" + off + "," + lim + ");}catch(e){return '[]';}})();");
+            if (raw == null) return null;
+            JSONArray arr = new JSONArray(raw);
+            if (arr.length() > 0) return arr;
+            return arr;
+        } catch (Exception e) {
+            // Fallback wajib: 1-per-1.
+            try {
+                JSONArray out = new JSONArray();
+                for (int k = 0; k < lim; k++) {
+                    try {
+                        String one = evalBridge(
+                                "(function(){try{return window.__imageStudio.getItemsJSON(" + (off + k) + ",1);}catch(e){return '[]';}})();");
+                        if (one == null) continue;
+                        JSONArray a = new JSONArray(one);
+                        if (a.length() > 0) out.put(a.get(0));
+                    } catch (Exception ignored) {}
+                }
+                return out;
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+    }
+
+    /** Evaluasi JS sinkron di thread IO (tunggu hasil via latch). */
+    private String evalBridge(final String js) {
+        final String[] box = new String[1];
+        final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        try {
             main.post(() -> {
                 try {
-                    web.evaluateJavascript(
-                            "(function(){try{"
-                                    + "var a=" + json + ";"
-                                    + "if(window.__imageStudio&&window.__imageStudio.restoreItems)"
-                                    + "window.__imageStudio.restoreItems(a);}catch(e){}})();",
-                            null);
-                } catch (Exception ignored) {
+                    web.evaluateJavascript(js, v -> {
+                        box[0] = unescapeJsString(v);
+                        latch.countDown();
+                    });
+                } catch (Exception e) {
+                    latch.countDown();
                 }
             });
-        });
+            latch.await(15, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception ignored) {}
+        return box[0];
     }
 
     private static String unescapeJsString(String v) {
@@ -470,48 +621,200 @@ public class MainActivity extends Activity {
         return v;
     }
 
-    // ---------------------------------------------------------------- backup file
-
-    private synchronized void writeBackupJson(String galleryJson) {
-        if (galleryJson == null) return;
+    private synchronized void writePart(int idx, JSONArray arr) {
         try {
-            // Validasi: harus array JSON.
-            JSONArray arr = new JSONArray(galleryJson);
-            if (arr.length() == 0) return;
-            File f = backupFile();
-            File bak = new File(backupDir, BACKUP_NAME + ".bak");
-            if (f.exists()) copyFile(f, bak);
-            try (OutputStream o = new FileOutputStream(f)) {
+            File f = partFile(idx);
+            File tmp = new File(backupDir, "part.tmp");
+            try (OutputStream o = new FileOutputStream(tmp)) {
                 o.write(arr.toString().getBytes(StandardCharsets.UTF_8));
             }
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(f);
         } catch (Exception e) {
-            trace("backup gagal: " + e);
+            trace("backup part gagal: " + e);
         }
     }
 
-    private synchronized String readBackupJson() {
+    private synchronized void cleanupParts(int keep) {
         try {
-            File f = backupFile();
-            if (!f.exists()) return null;
-            try (InputStream in = new FileInputStream(f)) {
-                byte[] buf = new byte[(int) Math.min(f.length(), 32 * 1024 * 1024)];
-                int n = in.read(buf);
-                if (n <= 0) return null;
-                return new String(buf, 0, n, StandardCharsets.UTF_8);
+            for (int i = keep; i < keep + 50; i++) {
+                File f = partFile(i);
+                if (f.exists() && !f.delete()) break;
+                if (!f.exists()) {
+                    // 3 lubang beruntun = habis.
+                    int miss = 0;
+                    for (int j = i; j < i + 3; j++) if (!partFile(j).exists()) miss++;
+                    if (miss == 3) break;
+                }
             }
+        } catch (Exception ignored) {}
+    }
+
+    private synchronized void writeManifest(int count, int rev, String sig, int parts) {
+        try {
+            File cur = manifestFile();
+            File bak = manifestBakFile();
+            if (cur.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                cur.renameTo(bak); // manifest lama = fallback, WAJIB ada
+            }
+            JSONObject m = new JSONObject();
+            m.put("count", count);
+            m.put("rev", rev);
+            m.put("sig", sig);
+            m.put("parts", parts);
+            File tmp = new File(backupDir, "manifest.tmp");
+            try (OutputStream o = new FileOutputStream(tmp)) {
+                o.write(m.toString().getBytes(StandardCharsets.UTF_8));
+            }
+            //noinspection ResultOfMethodCallIgnored
+            tmp.renameTo(cur);
+        } catch (Exception e) {
+            trace("manifest tulis gagal: " + e);
+        }
+    }
+
+    /** Baca manifest; rusak/hilang -> fallback .bak (dipakai, bukan hiasan). */
+    private synchronized void readManifest() {
+        try {
+            String raw = readWhole(manifestFile());
+            if (raw == null) raw = readWhole(manifestBakFile());
+            if (raw == null) { manifestSig = null; manifestCount = 0; manifestRev = 0; return; }
+            JSONObject m = new JSONObject(raw);
+            manifestCount = m.optInt("count", 0);
+            manifestRev = m.optInt("rev", 0);
+            manifestSig = m.optString("sig", null);
+            if (manifestSig != null && manifestSig.isEmpty()) manifestSig = null;
+        } catch (Exception e) {
+            try {
+                String raw = readWhole(manifestBakFile());
+                if (raw != null) {
+                    JSONObject m = new JSONObject(raw);
+                    manifestCount = m.optInt("count", 0);
+                    manifestRev = m.optInt("rev", 0);
+                    manifestSig = m.optString("sig", null);
+                    trace("manifest utama rusak, pakai .bak");
+                    return;
+                }
+            } catch (Exception ignored) {}
+            manifestSig = null;
+            manifestCount = 0;
+            manifestRev = 0;
+        }
+    }
+
+    private static String readWhole(File f) {
+        InputStream in = null;
+        try {
+            if (f == null || !f.exists()) return null;
+            long len = f.length();
+            if (len <= 0 || len > 64 * 1024 * 1024) return null;
+            in = new FileInputStream(f);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream((int) Math.min(len, 1 << 20));
+            byte[] buf = new byte[32768];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            return bos.toString("UTF-8");
         } catch (Exception e) {
             return null;
+        } finally {
+            try { if (in != null) in.close(); } catch (Exception ignored) {}
         }
     }
 
-    private static void copyFile(File a, File b) {
-        try (InputStream in = new FileInputStream(a);
-             OutputStream out = new FileOutputStream(b)) {
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-        } catch (Exception ignored) {
-        }
+    /** Dorong 10 pertama arsip saat arsip lebih baru dari web (jarang). */
+    private void pushFirstItems() {
+        io.execute(() -> {
+            try {
+                JSONArray first = new JSONArray();
+                for (int p = 0; first.length() < 10; p++) {
+                    String raw = readWhole(partFile(p));
+                    if (raw == null) break;
+                    try {
+                        JSONArray a = new JSONArray(raw);
+                        for (int i = 0; i < a.length() && first.length() < 10; i++) first.put(a.get(i));
+                        if (a.length() == 0) break;
+                    } catch (Exception e) { break; }
+                }
+                if (first.length() == 0) return;
+                final String json = first.toString();
+                main.post(() -> {
+                    try {
+                        web.evaluateJavascript(
+                                "(function(){try{"
+                                        + "var a=" + json + ";"
+                                        + "if(window.__imageStudio&&window.__imageStudio.restoreItems)"
+                                        + "window.__imageStudio.restoreItems(a,false);}catch(e){}})();",
+                                null);
+                    } catch (Exception ignored) {}
+                });
+            } catch (Exception e) {
+                trace("push awal gagal: " + e);
+            }
+        });
+    }
+
+    /** Umpan balik pill web (bukan notifikasi shade): hasil simpan file. */
+    private void onNativeSaved(final String name, final boolean ok) {
+        try {
+            final String safe = JSONObject.quote(name == null ? "" : name);
+            main.post(() -> {
+                try {
+                    web.evaluateJavascript(
+                            "(function(){try{"
+                                    + "if(window.__imageStudio&&window.__imageStudio.onNativeSaved)"
+                                    + "window.__imageStudio.onNativeSaved(" + safe + "," + (ok ? "true" : "false") + ");"
+                                    + "}catch(e){}})();",
+                            null);
+                } catch (Exception ignored) {}
+            });
+        } catch (Exception ignored) {}
+        trace(ok ? ("file ok: " + name) : ("file gagal: " + name));
+    }
+
+    // ---------------- dialog retry + crash log (murah, wajib) ----------------
+
+    private void showRetryDialog() {
+        try {
+            if (isFinishing()) return;
+            try { if (retryDlg != null) retryDlg.dismiss(); } catch (Exception ignored) {}
+            retryDlg = new AlertDialog.Builder(this)
+                    .setTitle("Gagal memuat")
+                    .setMessage("Periksa koneksi lalu coba lagi.")
+                    .setPositiveButton("Coba lagi", (di, w) -> {
+                        try {
+                            pageDone = false;
+                            pageFailed = false;
+                            web.reload();
+                        } catch (Exception ignored) {}
+                    })
+                    .setNegativeButton("Tutup", (di, w) -> finish())
+                    .setCancelable(true)
+                    .create();
+            retryDlg.show();
+        } catch (Exception ignored) {}
+    }
+
+    private void hookCrashLogger() {
+        try {
+            final Thread.UncaughtExceptionHandler def = Thread.getDefaultUncaughtExceptionHandler();
+            Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+                try {
+                    java.text.SimpleDateFormat df = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US);
+                    File dir = new File(rootDir != null ? rootDir : getFilesDir(), "error");
+                    //noinspection ResultOfMethodCallIgnored
+                    dir.mkdirs();
+                    File f = new File(dir, "crash-" + df.format(new java.util.Date()) + ".txt");
+                    try (FileOutputStream o = new FileOutputStream(f, true)) {
+                        java.io.PrintWriter pw = new java.io.PrintWriter(o);
+                        e.printStackTrace(pw);
+                        pw.println("---");
+                        pw.flush();
+                    }
+                } catch (Exception ignored) {}
+                try { if (def != null) def.uncaughtException(t, e); } catch (Exception ignored) {}
+            });
+        } catch (Exception ignored) {}
     }
 
     // ---------------------------------------------------------------- download
@@ -520,10 +823,15 @@ public class MainActivity extends Activity {
         if (url == null) return;
         io.execute(() -> {
             try {
-                if (url.startsWith("data:")) saveDataUrl(url);
-                else downloadHttp(url);
+                // Dua tombol, dua nasib: save -> galeri (web+backup), unduh -> file.
+                // Background diam: hasil lapor ke pill web, bukan notif shade.
+                if (url.startsWith("data:")) {
+                    String n = saveDataUrl(url);
+                    onNativeSaved(n, true);
+                } else downloadHttp(url);
             } catch (Exception e) {
-                toast("Unduh gagal: " + e.getMessage());
+                trace("unduh gagal: " + e.getMessage());
+                onNativeSaved("", false);
             }
         });
     }
@@ -550,7 +858,7 @@ public class MainActivity extends Activity {
         return "jpg";
     }
 
-    private void saveDataUrl(String dataUrl) throws Exception {
+    private String saveDataUrl(String dataUrl) throws Exception {
         int comma = dataUrl.indexOf(',');
         if (comma < 0) throw new Exception("data URL rusak");
         String head = dataUrl.substring(0, comma);
@@ -568,7 +876,7 @@ public class MainActivity extends Activity {
             int n;
             while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
         }
-        toast("Tersimpan: " + out.getName());
+        return out.getName();
     }
 
     private void downloadHttp(String url) {
@@ -576,8 +884,9 @@ public class MainActivity extends Activity {
         try {
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
             DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+            // VISIBLE saja (progres jalan, hilang sendiri): tanpa sisa di shade.
             r.setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                    DownloadManager.Request.VISIBILITY_VISIBLE);
             String name = "Generete_" + System.currentTimeMillis()
                     + "_" + fileCounter.incrementAndGet() + ".jpg";
             if (usingFallback || Build.VERSION.SDK_INT >= 29) {
@@ -587,8 +896,9 @@ public class MainActivity extends Activity {
                 r.setDestinationInExternalPublicDir(
                         "perchance_app/Generete_Image", "Generation/" + name);
             }
-            dm.enqueue(r);
-            toast("Mengunduh: " + name);
+            long did = dm.enqueue(r);
+            synchronized (httpNames) { httpNames.put(did, name); }
+            trace("mengunduh: " + name);
         } catch (Exception e) {
             try {
                 c.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
@@ -614,6 +924,16 @@ public class MainActivity extends Activity {
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
             File f = new File(dir, "trace.txt");
+            try {
+                // Rotasi murah: >512KB -> trace.old, agar tak membengkak.
+                if (f.exists() && f.length() > 512 * 1024) {
+                    File old = new File(dir, "trace.old");
+                    //noinspection ResultOfMethodCallIgnored
+                    if (old.exists()) old.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    f.renameTo(old);
+                }
+            } catch (Exception ignored) {}
             try (FileOutputStream o = new FileOutputStream(f, true)) {
                 o.write((msg + "\n").getBytes(StandardCharsets.UTF_8));
             }
@@ -683,15 +1003,16 @@ public class MainActivity extends Activity {
     }
 
     // Update OTOMATIS: ketemu versi baru -> langsung unduh di dalam aplikasi
-    // (tanpa buka GitHub, tanpa ditanya). Kalau file tag ini sudah ada -> ajak
-    // pasang. Kalau sedang mengunduh -> biarkan jalan.
+    // (tanpa buka GitHub, tanpa ditanya, tanpa dialog). Kalau file tag ini
+    // sudah ada -> langsung pasang. Kalau sedang mengunduh -> biarkan jalan.
     private void onUpdateFound(String apkUrl, String tag) {
         try {
             File apk = new File(new File(getExternalFilesDir(null), "update"), "norvex-i.apk");
             SharedPreferences sp = getSharedPreferences("nv-i", MODE_PRIVATE);
             String have = sp.getString(UPD_PREF_TAG, "");
             if (tag.equals(have) && apk.exists() && apk.length() > 0) {
-                showUpdateReadyDialog(apk, tag);
+                final File fApk = apk;
+                main.post(() -> promptInstall(fApk));
                 return;
             }
             if (updateDownloadId != -1) { trace("update masih mengunduh: " + tag); return; }
@@ -707,29 +1028,13 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { trace("update-found gagal: " + t); }
     }
 
-    private void showUpdateReadyDialog(final File apk, String tag) {
-        try {
-            try { if (updateDialog != null) updateDialog.dismiss(); } catch (Exception ignored) {}
-            updateDialog = new AlertDialog.Builder(this)
-                    .setTitle("Update " + tag + " siap dipasang")
-                    .setMessage("Versi " + tag + " sudah terunduh. Pasang sekarang?")
-                    .setPositiveButton("Pasang", (di, w) -> promptInstall(apk))
-                    .setNegativeButton("Nanti", null)
-                    .setCancelable(true)
-                    .create();
-            updateDialog.show();
-            trace("update siap: " + tag);
-        } catch (Throwable t) { trace("update-dlg gagal: " + t); }
-    }
-
     private void startUpdateDownload(String apkUrl) {
         try {
-            toast("Mengunduh update…");
             DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
             if (dm == null) return;
             DownloadManager.Request r = new DownloadManager.Request(Uri.parse(apkUrl));
             r.setTitle("NorVex-I update");
-            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE);
             File dir = new File(getExternalFilesDir(null), "update");
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
@@ -746,19 +1051,27 @@ public class MainActivity extends Activity {
             try {
                 if (!DownloadManager.ACTION_DOWNLOAD_COMPLETE.equals(intent.getAction())) return;
                 long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
-                if (id != updateDownloadId || id == -1) return; // unduhan gambar: biarkan notif sistem
-                updateDownloadId = -1;
-                File apk = new File(ctx.getExternalFilesDir(null), "update/norvex-i.apk");
-                String tag = "";
-                try { tag = ctx.getSharedPreferences("nv-i", MODE_PRIVATE).getString(UPD_PREF_TAG, ""); } catch (Exception ignored) {}
-                // SUKSES beneran (bukan gagal/batal): status DownloadManager +
-                // file ada + berisi. Tanpa ini, APK setengah/basi dikira siap.
-                if (dmSuccess(ctx, id) && apk.exists() && apk.length() > 0) {
-                    final String fTag = tag;
-                    main.post(() -> showUpdateReadyDialog(apk, fTag));
-                } else {
-                    toast("Unduhan update gagal, coba lagi nanti");
-                    trace("update-dl: file hilang/gagal");
+                if (id == updateDownloadId && id != -1) {
+                    updateDownloadId = -1;
+                    File apk = new File(ctx.getExternalFilesDir(null), "update/norvex-i.apk");
+                    // SUKSES beneran (bukan gagal/batal): status DownloadManager +
+                    // file ada + berisi. Tanpa ini, APK setengah/basi dikira siap.
+                    if (dmSuccess(ctx, id) && apk.exists() && apk.length() > 0) {
+                        trace("update siap, pasang langsung");
+                        final File fApk = apk;
+                        main.post(() -> promptInstall(fApk));
+                    } else {
+                        trace("update-dl: file hilang/gagal");
+                    }
+                    return;
+                }
+                // Unduhan gambar: lapor ke pill web, diam di shade.
+                String nm;
+                synchronized (httpNames) { nm = httpNames.remove(id); }
+                if (nm != null) {
+                    final boolean ok = dmSuccess(ctx, id);
+                    final String fNm = nm;
+                    main.post(() -> onNativeSaved(fNm, ok));
                 }
             } catch (Throwable t) { trace("receiver gagal: " + t); }
         }
@@ -799,15 +1112,52 @@ public class MainActivity extends Activity {
             i.setDataAndType(uri, "application/vnd.android.package-archive");
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
             try { startActivity(i); }
-            catch (android.content.ActivityNotFoundException e) { toast("Tak ada pemasang paket"); trace("install: " + e); }
+            catch (android.content.ActivityNotFoundException e) { trace("install: " + e); }
         } catch (Throwable t) { trace("install gagal: " + t); }
     }
 
     public class NativeBridge {
+        /** Ringkasan arsip buat scroll lazy web: {"count":N,"rev":R}. */
         @JavascriptInterface
-        public String getBackup() {
-            String j = readBackupJson();
-            return j == null ? "[]" : j;
+        public String getBackupInfo() {
+            try {
+                readManifest();
+                JSONObject m = new JSONObject();
+                m.put("count", manifestCount);
+                m.put("rev", manifestRev);
+                return m.toString();
+            } catch (Exception e) {
+                return "{\"count\":0,\"rev\":0}";
+            }
+        }
+
+        /** Jendela arsip buat scroll lazy: maks 5 item per panggil (batas binder). */
+        @JavascriptInterface
+        public String getBackupRangeJSON(int offset, int limit) {
+            try {
+                int off = Math.max(0, offset);
+                int lim = Math.max(1, Math.min(5, limit));
+                readManifest();
+                JSONArray out = new JSONArray();
+                int idx = off;
+                int end = off + lim;
+                while (idx < end) {
+                    int part = idx / BACKUP_PART_SIZE;
+                    int at = idx % BACKUP_PART_SIZE;
+                    String raw = readWhole(partFile(part));
+                    if (raw == null) break;
+                    JSONArray a;
+                    try { a = new JSONArray(raw); } catch (Exception e) { break; }
+                    if (at >= a.length()) break;
+                    for (int i = at; i < a.length() && idx < end; i++, idx++) {
+                        try { out.put(a.get(i)); } catch (Exception ignored) { idx++; }
+                    }
+                    if (a.length() < BACKUP_PART_SIZE) break;
+                }
+                return out.toString();
+            } catch (Exception e) {
+                return "[]";
+            }
         }
     }
 }
