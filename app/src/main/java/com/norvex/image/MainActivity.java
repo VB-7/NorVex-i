@@ -14,6 +14,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
@@ -53,7 +54,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class MainActivity extends Activity {
 
     private static final String START_URL = "https://perchance.org/norvex-i";
-    private static final String PRIMARY_ROOT = "/storage/emulated/0/perchance_app/Generete_Image";
+    // Relatif terhadap root storage eksternal (jangan hardcode /storage/emulated/0:
+    // tiap HP bisa beda — pola NorVex-R pakai Environment API).
+    private static final String PRIMARY_ROOT = "perchance_app/Generete_Image";
     // Repo GitHub untuk update otomatis (pola NorVex-R). GANTI dengan repo kamu,
     // mis. "USERNAME_KAMU/NorVex-I". Tag rilis "b<N>" dibaca sebagai versionCode N.
     private static final String UPDATE_REPO = "VB-7/NorVex-i";
@@ -98,34 +101,24 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- storage
 
     private void resolveStorage() {
-        File primary = new File(PRIMARY_ROOT);
-        File gen = new File(primary, "Generation");
-        File bak = new File(primary, "Backup_Gallery");
-        boolean ok = false;
+        // Basis folder: <external>/perchance_app/Generete_Image (WAJIB user).
+        // Gagal (scoped storage / tanpa izin) -> folder khusus aplikasi (selalu bisa).
+        // Pola NorVex-R: Environment API + mkdirs + isDirectory + canWrite.
+        File base = null;
         try {
-            ok = (gen.isDirectory() || gen.mkdirs()) && (bak.isDirectory() || bak.mkdirs());
-            if (ok) {
-                File probe = new File(gen, ".probe");
-                try (OutputStream o = new FileOutputStream(probe)) {
-                    o.write(1);
-                }
-                ok = probe.delete();
-            }
-        } catch (Exception ignored) {
-            ok = false;
-        }
-        if (ok) {
-            rootDir = primary;
+            File ext = new File(Environment.getExternalStorageDirectory(), PRIMARY_ROOT);
+            //noinspection ResultOfMethodCallIgnored
+            ext.mkdirs();
+            if (ext.isDirectory() && ext.canWrite()) base = ext;
+        } catch (Exception ignored) {}
+        if (base != null) {
+            rootDir = base;
             usingFallback = false;
         } else {
             // Fallback: ASD, pola yang sama seperti NorVex-r.
             File asd = new File(getExternalFilesDir(null), "NorVex-I");
-            gen = new File(asd, "Generation");
-            bak = new File(asd, "Backup_Gallery");
             //noinspection ResultOfMethodCallIgnored
-            gen.mkdirs();
-            //noinspection ResultOfMethodCallIgnored
-            bak.mkdirs();
+            asd.mkdirs();
             rootDir = asd;
             usingFallback = true;
         }
@@ -346,6 +339,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        destroyed = true;
         io.shutdown();
         try { unregisterReceiver(dlReceiver); } catch (Exception ignored) {}
         try { if (retryDlg != null) retryDlg.dismiss(); } catch (Exception ignored) {}
@@ -875,6 +869,7 @@ public class MainActivity extends Activity {
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+            try { ((FileOutputStream) o).getFD().sync(); } catch (Exception ignored) {}
         }
         return out.getName();
     }
@@ -893,11 +888,14 @@ public class MainActivity extends Activity {
                 File out = new File(generationDir, name);
                 r.setDestinationUri(Uri.fromFile(out));
             } else {
+                // Pola NorVex-R: tipe tanpa garis miring, subpath yang bersarang.
+                // (Tipe berisi "/" ditolak di sebagian HP = gagal tulis legacy.)
                 r.setDestinationInExternalPublicDir(
-                        "perchance_app/Generete_Image", "Generation/" + name);
+                        "perchance_app", "Generete_Image/Generation/" + name);
             }
             long did = dm.enqueue(r);
             synchronized (httpNames) { httpNames.put(did, name); }
+            pollDmProgress();
             trace("mengunduh: " + name);
         } catch (Exception e) {
             try {
@@ -920,6 +918,12 @@ public class MainActivity extends Activity {
 
     private void trace(String msg) {
         try {
+            String ts = "";
+            try {
+                ts = new java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+                        .format(new java.util.Date()) + " ";
+            } catch (Exception ignored) {}
+            final String line = ts + msg;
             File dir = new File(rootDir, "error");
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
@@ -935,7 +939,7 @@ public class MainActivity extends Activity {
                 }
             } catch (Exception ignored) {}
             try (FileOutputStream o = new FileOutputStream(f, true)) {
-                o.write((msg + "\n").getBytes(StandardCharsets.UTF_8));
+                o.write((line + "\n").getBytes(StandardCharsets.UTF_8));
             }
         } catch (Exception ignored) {
         }
@@ -1040,9 +1044,75 @@ public class MainActivity extends Activity {
             dir.mkdirs();
             r.setDestinationInExternalFilesDir(this, "update", "norvex-i.apk");
             updateDownloadId = dm.enqueue(r);
+            pollDmProgress();
         } catch (Throwable t) {
             trace("update-dl gagal: " + t);
         }
+    }
+
+    // Intip progres DownloadManager tiap detik -> persen ke pill web
+    // (bukan notif shade). Berhenti sendiri saat tak ada kerjaan / activity mati.
+    private volatile boolean destroyed = false;
+    private boolean dmPolling = false;
+    private final java.util.Map<Long, Integer> dmLastPct = new java.util.HashMap<Long, Integer>();
+
+    private void pollDmProgress() {
+        try {
+            if (dmPolling) return;
+            dmPolling = true;
+            new Thread(() -> {
+                try {
+                    DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+                    while (true) {
+                        if (destroyed) break;
+                        java.util.Map<Long, String> jobs = new java.util.HashMap<Long, String>();
+                        synchronized (httpNames) { jobs.putAll(httpNames); }
+                        long upd = updateDownloadId;
+                        if (upd != -1) jobs.put(upd, "update");
+                        if (jobs.isEmpty() || dm == null) break;
+                        for (java.util.Map.Entry<Long, String> en : jobs.entrySet()) {
+                            try {
+                                android.database.Cursor c = null;
+                                try {
+                                    c = dm.query(new DownloadManager.Query().setFilterById(en.getKey()));
+                                    if (c != null && c.moveToFirst()) {
+                                        long done = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                                        long total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                                        if (total > 0) {
+                                            int pct = (int) (done * 100 / total);
+                                            Integer last;
+                                            synchronized (dmLastPct) { last = dmLastPct.get(en.getKey()); }
+                                            if (last == null || pct - last >= 2 || pct >= 100) {
+                                                synchronized (dmLastPct) { dmLastPct.put(en.getKey(), pct); }
+                                                onNativeProgress(en.getValue(), pct);
+                                            }
+                                        }
+                                    }
+                                } finally { try { if (c != null) c.close(); } catch (Exception ignored) {} }
+                            } catch (Exception ignored) {}
+                        }
+                        try { Thread.sleep(1000); } catch (Exception ignored) {}
+                    }
+                } catch (Exception ignored) {}
+                dmPolling = false;
+            }).start();
+        } catch (Exception ignored) {}
+    }
+
+    private void onNativeProgress(final String name, final int pct) {
+        try {
+            final String safe = JSONObject.quote(name == null ? "" : name);
+            main.post(() -> {
+                try {
+                    web.evaluateJavascript(
+                            "(function(){try{"
+                                    + "if(window.__imageStudio&&window.__imageStudio.onNativeProgress)"
+                                    + "window.__imageStudio.onNativeProgress(" + safe + "," + pct + ");"
+                                    + "}catch(e){}})();",
+                            null);
+                } catch (Exception ignored) {}
+            });
+        } catch (Exception ignored) {}
     }
 
     private final BroadcastReceiver dlReceiver = new BroadcastReceiver() {
@@ -1053,6 +1123,7 @@ public class MainActivity extends Activity {
                 long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
                 if (id == updateDownloadId && id != -1) {
                     updateDownloadId = -1;
+                    synchronized (dmLastPct) { dmLastPct.remove(id); }
                     File apk = new File(ctx.getExternalFilesDir(null), "update/norvex-i.apk");
                     // SUKSES beneran (bukan gagal/batal): status DownloadManager +
                     // file ada + berisi. Tanpa ini, APK setengah/basi dikira siap.
@@ -1068,6 +1139,7 @@ public class MainActivity extends Activity {
                 // Unduhan gambar: lapor ke pill web, diam di shade.
                 String nm;
                 synchronized (httpNames) { nm = httpNames.remove(id); }
+                synchronized (dmLastPct) { dmLastPct.remove(id); }
                 if (nm != null) {
                     final boolean ok = dmSuccess(ctx, id);
                     final String fNm = nm;
